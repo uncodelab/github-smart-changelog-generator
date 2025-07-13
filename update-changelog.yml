@@ -1,0 +1,150 @@
+# GitHub Smart Changelog Generator v0.1.0
+#
+# Purpose: Automatically generates and updates a categorized CHANGELOG.md file
+# for new releases based on Conventional Commits.
+#
+# Repository: https://github.com/uncodelab/github-smart-changelog-generator
+
+name: GitHub Smart Changelog Generator v0.1.0
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version info
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          DATE=$(date +%Y-%m-%d)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/your-repo
+          path: repo
+          token: ${{ secrets.REPO_TOKEN }}
+
+      - name: Generate categorized changelog
+        id: changelog
+        run: |
+          declare -a skip_patterns=(
+            "version bump"
+            "merge branch"
+            "update changelog for"
+          )
+
+          declare -A categories=(
+            [feat]="New Features"
+            [fix]="Bug Fixes"
+            [docs]="Documentation"
+            [style]="Code Style"
+            [refactor]="Refactoring"
+            [perf]="Performance"
+            [test]="Tests"
+            [chore]="Maintenance"
+          )
+
+          if [ $(git tag | wc -l) -eq 1 ]; then
+            COMMITS=$(git log --reverse --pretty=format:"%s" --no-merges)
+          else
+            PREV_TAG=$(git describe --tags --abbrev=0 "${{ github.ref }}^")
+            COMMITS=$(git log --pretty=format:"%s" ${PREV_TAG}..HEAD --no-merges)
+          fi
+
+          declare -A changes
+          uncategorized_changes=""
+
+          while IFS= read -r msg; do
+            skip=false
+            for pattern in "${skip_patterns[@]}"; do
+              if [[ "${msg,,}" == *"${pattern,,}"* ]]; then
+                skip=true
+                break
+              fi
+            done
+            $skip && continue
+
+            if [[ $msg =~ ^ci: ]]; then
+              continue
+            fi
+
+            if [[ $msg =~ ^(feat|fix|docs|style|refactor|perf|test|chore):\ (.+) ]]; then
+              type=${BASH_REMATCH[1]}
+              description=${BASH_REMATCH[2]}
+              changes[$type]+="- ${description}\n"
+            else
+              uncategorized_changes+="- ${msg}\n"
+            fi
+          done <<< "$COMMITS"
+
+          OUTPUT=""
+          for type in feat fix docs style refactor perf test chore; do
+            if [ -n "${changes[$type]}" ]; then
+              OUTPUT+="### ${categories[$type]}\n${changes[$type]}\n"
+            fi
+          done
+          if [ -n "$uncategorized_changes" ]; then
+            OUTPUT+="### Uncategorized\n${uncategorized_changes}\n"
+          fi
+
+          if [ -z "$OUTPUT" ]; then
+            OUTPUT="### No changes\n"
+          fi
+
+          OUTPUT=$(echo -e "$OUTPUT" | sed -E 's/^\n+//;s/\n+$//')
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update changelog file
+        run: |
+          if ! cd repo; then
+            echo "Error: Failed to cd into repo directory" >&2
+            exit 1
+          fi
+          if [ -f CHANGELOG.md ]; then
+            EXISTING_CONTENT=$(cat CHANGELOG.md | sed -E '/^# Changelog$/d' | sed -E '/^# Changelog\n$/d' | sed -E 's/^\n+//;s/\n+$//' || {
+              echo "Error: Failed to process CHANGELOG.md" >&2
+              exit 1
+            })
+          else
+            EXISTING_CONTENT=""
+          fi
+
+          {
+            echo "# Changelog"
+            echo ""
+            echo "## [${{ steps.version.outputs.version }}] - ${{ steps.version.outputs.date }}"
+            echo ""
+            echo -e "${{ steps.changelog.outputs.changelog }}"
+            if [ -n "$EXISTING_CONTENT" ]; then
+              echo "$EXISTING_CONTENT"
+            fi
+          } > CHANGELOG.md || {
+            echo "Error: Failed to write CHANGELOG.md" >&2
+            exit 1
+          }
+
+      - name: Commit and push
+        run: |
+          cd repo || { echo "Error: Failed to cd into repo directory" >&2; exit 1; }
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add CHANGELOG.md || { echo "Error: Failed to add CHANGELOG.md" >&2; exit 1; }
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "docs: Update changelog for ${{ steps.version.outputs.version }}" || { echo "Error: Failed to commit changes" >&2; exit 1; }
+            git push origin HEAD:main || { echo "Error: Failed to push changes" >&2; exit 1; }
+          fi
